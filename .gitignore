@@ -1,0 +1,6 @@
+node_modules
+.env
+*.log
+firebase-key.json
+.DS_Store
+amptron-apartments-2e4ea-firebase-adminsdk-*.json

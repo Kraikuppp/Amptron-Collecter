@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tuya Smart Meter Data</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/axios/1.6.2/axios.min.js"></script>
+    <style>
+        body {
+            background-color: #f3f4f6;
+        }
+
+        .card {
+            background: white;
+            border-radius: 1rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+
+<body class="p-8">
+    <div class="max-w-4xl mx-auto">
+        <div class="card p-8 mb-8">
+            <div class="flex justify-between items-center mb-6">
+                <h1 class="text-2xl font-bold text-gray-800">Tuya Smart Meter Monitor</h1>
+                <div class="flex items-center gap-2">
+                    <span id="lastUpdated" class="text-xs text-gray-500"></span>
+                    <div class="animate-pulse w-2 h-2 bg-green-500 rounded-full"></div>
+                    <span class="text-xs text-green-600 font-medium">Live</span>
+                </div>
+            </div>
+
+            <!-- Status & Error -->
+            <div id="status" class="hidden p-4 rounded-lg mb-4"></div>
+
+            <!-- Results -->
+            <div id="resultArea">
+                <div id="metrics" class="space-y-8">
+                    <!-- Device sections will be populated here -->
+                </div>
+            </div>
+        </div>
+
+        <div class="text-center text-sm text-gray-500">
+            <p class="mb-2">⚠️ <strong>Important Note:</strong></p>
+            <p>This page requires a local proxy server to function.</p>
+            <p>Please run <code>npm install</code> and <code>node server.js</code> in the root folder.</p>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const PROXY_URL = 'http://localhost:3000';
+        const KNOWN_DEVICES = ['a32ca52fe390525ac5gss3', 'a3e540a09673f26b29h48u'];
+        const POLLING_INTERVAL = 5000; // 5 seconds
+
+        // Helper function to decode Base64 values (Tuya Breaker Format)
+        function decodeBase64Value(value, code) {
+            // Check if value is a Base64 string
+            if (typeof value === 'string' && value.match(/^[A-Za-z0-9+/]+=*$/)) {
+                try {
+                    // Decode Base64 to binary
+                    const binaryString = atob(value);
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let i = 0; i < binaryString.length; i++) {
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }
+
+                    // Tuya Breaker Format (8 bytes):
+                    // Bytes 0-1: Voltage (Big Endian), unit = 0.1V
+                    // Bytes 2-3: Current (Little Endian), unit = mA
+                    // Bytes 4-5: Power (Little Endian), unit = W
+                    // Bytes 6-7: Reserved
+
+                    if (bytes.length >= 8) {
+                        const dataView = new DataView(bytes.buffer);
+
+                        // Voltage: Bytes 0-1 (Big Endian)
+                        const voltageRaw = dataView.getUint16(0, false); // false = big endian
+                        const voltage = voltageRaw / 10; // unit = 0.1V
+
+                        // Current: Bytes 2-3 (Little Endian)
+                        const current = dataView.getUint16(2, true); // true = little endian, unit = mA
+
+                        // Power: Bytes 4-5 (Little Endian)
+                        const power = dataView.getUint16(4, true); // true = little endian, unit = W
+
+                        return {
+                            decoded: true,
+                            voltage: voltage,
+                            current: current,
+                            power: power,
+                            originalBase64: value,
+                            hexDump: Array.from(bytes).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ')
+                        };
+                    }
+                } catch (e) {
+                    console.warn(`Failed to decode Base64 for ${code}:`, e);
+                }
+            }
+            return { decoded: false, rawValue: value };
+        }
+
+        // Start polling on load
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchAllData();
+            setInterval(fetchAllData, POLLING_INTERVAL);
+        });
+
+        async function fetchAllData() {
+            const statusDiv = document.getElementById('status');
+            const metricsDiv = document.getElementById('metrics');
+            const lastUpdated = document.getElementById('lastUpdated');
+
+            lastUpdated.textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
+
+            try {
+                // 1. Get Access Token via Proxy (once per cycle)
+                const tokenResponse = await axios.get(`${PROXY_URL}/token`);
+                if (!tokenResponse.data.success) {
+                    throw new Error('Failed to get token: ' + tokenResponse.data.msg);
+                }
+                const accessToken = tokenResponse.data.result.access_token;
+
+                // 2. Fetch data for all devices
+                for (const deviceId of KNOWN_DEVICES) {
+                    await fetchAndRenderDevice(deviceId, accessToken);
+                }
+
+                // Clear error status if successful
+                statusDiv.classList.add('hidden');
+
+            } catch (error) {
+                console.error('Polling Error:', error);
+                showStatus(`Connection Error: ${error.message}`, 'error');
+            }
+        }
+
+        async function fetchAndRenderDevice(deviceId, accessToken) {
+            try {
+                // Fetch Properties (Shadow)
+                const propsResponse = await axios.get(`${PROXY_URL}/device/${deviceId}/properties`, {
+                    headers: { 'access_token': accessToken }
+                });
+
+                // Fetch State (Latest)
+                const stateResponse = await axios.get(`${PROXY_URL}/device/${deviceId}/state`, {
+                    headers: { 'access_token': accessToken }
+                });
+
+                const propsData = propsResponse.data.success ? propsResponse.data.result : null;
+                const stateData = stateResponse.data.success ? stateResponse.data.result : null;
+
+                renderDeviceCard(deviceId, propsData, stateData);
+
+            } catch (err) {
+                console.error(`Error fetching device ${deviceId}:`, err);
+                renderErrorCard(deviceId, err.message);
+            }
+        }
+
+        function renderDeviceCard(deviceId, propsData, stateData) {
+            const metricsDiv = document.getElementById('metrics');
+            let deviceContainer = document.getElementById(`device-${deviceId}`);
+
+            if (!deviceContainer) {
+                deviceContainer = document.createElement('div');
+                deviceContainer.id = `device-${deviceId}`;
+                deviceContainer.className = 'border rounded-xl p-6 bg-gray-50';
+                metricsDiv.appendChild(deviceContainer);
+            }
+
+            // Combine data sources
+            let combinedItems = [];
+
+            // Helper to normalize
+            const normalize = (data) => {
+                if (!data) return [];
+                if (Array.isArray(data)) return data;
+                if (data.properties && Array.isArray(data.properties)) return data.properties;
+                return Object.entries(data).map(([k, v]) => {
+                    if (v && typeof v === 'object' && 'value' in v) return { code: k, ...v };
+                    return { code: k, value: v };
+                });
+            };
+
+            const propsItems = normalize(propsData);
+            const stateItems = normalize(stateData);
+
+            // Merge: Prefer state data (real-time) over properties if duplicates exist
+            const itemMap = new Map();
+            propsItems.forEach(i => itemMap.set(i.code, { ...i, source: 'Shadow' }));
+            stateItems.forEach(i => itemMap.set(i.code, { ...i, source: 'State' })); // Overwrite
+
+            const items = Array.from(itemMap.values());
+
+            // Generate HTML for metrics
+            let metricsHtml = '';
+            if (items.length === 0) {
+                metricsHtml = '<div class="text-gray-500 italic">No data available</div>';
+            } else {
+                metricsHtml = items.map(item => {
+                    let color = 'bg-white border border-gray-200 text-gray-700';
+                    let label = item.code || 'Unknown';
+                    let rawValue = item.value;
+                    let value = rawValue;
+                    let unit = '';
+                    let decodedInfo = '';
+                    let extraMetrics = '';
+
+                    // Try to decode Base64 if applicable
+                    const decoded = decodeBase64Value(rawValue, item.code);
+                    if (decoded.decoded) {
+                        // For phase data, we have voltage, current, and power
+                        if (label.includes('phase')) {
+                            label = label.replace('_', ' ').toUpperCase();
+
+                            // Create multiple cards for this phase
+                            const phaseCards = [];
+
+                            // Voltage card
+                            phaseCards.push(`
+                                <div class="bg-purple-50 border-purple-100 text-purple-800 p-3 rounded-lg shadow-sm flex flex-col justify-between">
+                                    <div>
+                                        <div class="text-xs font-semibold uppercase tracking-wide opacity-70">${label} - Voltage <span class="text-[9px] opacity-40">(decoded)</span></div>
+                                        <div class="text-xl font-bold mt-1">${decoded.voltage.toFixed(1)} <span class="text-sm font-normal opacity-75">V</span></div>
+                                    </div>
+                                    <div class="flex justify-between items-end mt-2">
+                                        <div class="text-[10px] opacity-50 font-mono">${item.code}</div>
+                                        <div class="text-[10px] px-1.5 py-0.5 rounded bg-black/5 opacity-60">${item.source || 'API'}</div>
+                                    </div>
+                                </div>
+                            `);
+
+                            // Current card
+                            phaseCards.push(`
+                                <div class="bg-green-50 border-green-100 text-green-800 p-3 rounded-lg shadow-sm flex flex-col justify-between">
+                                    <div>
+                                        <div class="text-xs font-semibold uppercase tracking-wide opacity-70">${label} - Current <span class="text-[9px] opacity-40">(decoded)</span></div>
+                                        <div class="text-xl font-bold mt-1">${decoded.current} <span class="text-sm font-normal opacity-75">mA</span></div>
+                                    </div>
+                                    <div class="flex justify-between items-end mt-2">
+                                        <div class="text-[10px] opacity-50 font-mono">${item.code}</div>
+                                        <div class="text-[10px] px-1.5 py-0.5 rounded bg-black/5 opacity-60">${item.source || 'API'}</div>
+                                    </div>
+                                </div>
+                            `);
+
+                            // Power card
+                            phaseCards.push(`
+                                <div class="bg-yellow-50 border-yellow-100 text-yellow-800 p-3 rounded-lg shadow-sm flex flex-col justify-between">
+                                    <div>
+                                        <div class="text-xs font-semibold uppercase tracking-wide opacity-70">${label} - Power <span class="text-[9px] opacity-40">(decoded)</span></div>
+                                        <div class="text-xl font-bold mt-1">${decoded.power} <span class="text-sm font-normal opacity-75">W</span></div>
+                                    </div>
+                                    <div class="flex justify-between items-end mt-2">
+                                        <div class="text-[10px] opacity-50 font-mono">${item.code}</div>
+                                        <div class="text-[10px] px-1.5 py-0.5 rounded bg-black/5 opacity-60">${item.source || 'API'}</div>
+                                    </div>
+                                </div>
+                            `);
+
+                            return phaseCards.join('');
+                        }
+
+                        value = decoded.voltage;
+                        decodedInfo = ` <span class="text-[9px] opacity-40">(decoded)</span>`;
+                    }
+
+                    // Customize based on code (for non-decoded values)
+                    if (!decoded.decoded) {
+                        if (['cur_power', 'power'].some(k => label.includes(k))) {
+                            label = 'Power';
+                            unit = 'W';
+                            color = 'bg-yellow-50 border-yellow-100 text-yellow-800';
+                        } else if (['cur_current', 'current'].some(k => label.includes(k))) {
+                            label = 'Current';
+                            unit = 'mA';
+                            color = 'bg-green-50 border-green-100 text-green-800';
+                        } else if (['cur_voltage', 'voltage'].some(k => label.includes(k))) {
+                            label = 'Voltage';
+                            value = (value / 10).toFixed(1);
+                            unit = 'V';
+                            color = 'bg-purple-50 border-purple-100 text-purple-800';
+                        } else if (['add_ele', 'total_electricity'].some(k => label.includes(k))) {
+                            label = 'Total Energy';
+                            unit = 'kWh';
+                            color = 'bg-indigo-50 border-indigo-100 text-indigo-800';
+                        }
+                    }
+
+                    return `
+                        <div class="${color} p-3 rounded-lg shadow-sm flex flex-col justify-between">
+                            <div>
+                                <div class="text-xs font-semibold uppercase tracking-wide opacity-70">${label}${decodedInfo}</div>
+                                <div class="text-xl font-bold mt-1">${value} <span class="text-sm font-normal opacity-75">${unit}</span></div>
+                            </div>
+                            <div class="flex justify-between items-end mt-2">
+                                <div class="text-[10px] opacity-50 font-mono">${item.code}</div>
+                                <div class="text-[10px] px-1.5 py-0.5 rounded bg-black/5 opacity-60">${item.source || 'API'}</div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            }
+
+            deviceContainer.innerHTML = `
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-lg font-bold text-gray-800 flex items-center gap-2">
+                        <span class="w-2 h-8 bg-blue-500 rounded-full"></span>
+                        Device: <span class="font-mono text-blue-600">${deviceId}</span>
+                    </h3>
+                    <div class="text-xs text-gray-400">
+                        ${items.length} metrics
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    ${metricsHtml}
+                </div>
+            `;
+        }
+
+        function renderErrorCard(deviceId, errorMsg) {
+            const metricsDiv = document.getElementById('metrics');
+            let deviceContainer = document.getElementById(`device-${deviceId}`);
+
+            if (!deviceContainer) {
+                deviceContainer = document.createElement('div');
+                deviceContainer.id = `device-${deviceId}`;
+                metricsDiv.appendChild(deviceContainer);
+            }
+
+            deviceContainer.className = 'border border-red-200 rounded-xl p-6 bg-red-50';
+            deviceContainer.innerHTML = `
+                <h3 class="text-lg font-bold text-red-800 mb-2">Device: ${deviceId}</h3>
+                <p class="text-sm text-red-600">Failed to fetch data: ${errorMsg}</p>
+            `;
+        }
+
+        function showStatus(message, type) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.classList.remove('hidden', 'bg-red-100', 'text-red-700', 'bg-green-100', 'text-green-700', 'bg-blue-100', 'text-blue-700');
+
+            if (type === 'error') {
+                statusDiv.classList.add('bg-red-100', 'text-red-700');
+            } else if (type === 'success') {
+                statusDiv.classList.add('bg-green-100', 'text-green-700');
+            } else {
+                statusDiv.classList.add('bg-blue-100', 'text-blue-700');
+            }
+
+            statusDiv.textContent = message;
+        }
+    </script>
+</body>
+
+</html>
